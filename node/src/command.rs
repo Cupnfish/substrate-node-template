@@ -207,9 +207,10 @@ pub fn run() -> sc_cli::Result<()> {
 			runner.sync_run(|config| cmd.run::<Block>(&config))
 		},
 		None => {
+			let is_alice = cli.run.alice;
 			let runner = cli.create_runner(&cli.run)?;
 			runner.run_node_until_exit(|config| async move {
-				service::new_full(config).map_err(sc_cli::Error::Service)
+				service::new_full(config, is_alice).map_err(sc_cli::Error::Service)
 			})
 		},
 	}

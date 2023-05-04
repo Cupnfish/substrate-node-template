@@ -155,7 +155,7 @@ fn remote_keystore(_url: &String) -> Result<Arc<LocalKeystore>, &'static str> {
 }
 
 /// Builds a new service for a full client.
-pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> {
+pub fn new_full(mut config: Configuration, is_alice: bool) -> Result<TaskManager, ServiceError> {
 	let sc_service::PartialComponents {
 		client,
 		backend,
@@ -192,8 +192,16 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 		Vec::default(),
 	));
 
+	let ddns_manager = pns_ddns::DdnsNetworkManager::default();
+	let offchain_db = Arc::new(std::sync::Mutex::new(pns_ddns::OffChain {
+		db: pns_ddns::from_backend(&*backend.clone()).expect("offchain db from backend failed."),
+	}));
+
 	let (network, system_rpc_tx, tx_handler_controller, network_starter, sync_service) =
-		sc_service::build_network(sc_service::BuildNetworkParams {
+		pns_ddns::build_network(		pns_ddns::DdnsNetworkParams {
+			offchain_db: offchain_db.clone(),
+			manager: ddns_manager.clone(),
+		},sc_service::BuildNetworkParams {
 			config: &config,
 			client: client.clone(),
 			transaction_pool: transaction_pool.clone(),
@@ -237,13 +245,41 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 		task_manager: &mut task_manager,
 		transaction_pool: transaction_pool.clone(),
 		rpc_builder: rpc_extensions_builder,
-		backend,
+		backend: backend.clone(),
 		system_rpc_tx,
 		tx_handler_controller,
 		sync_service: sync_service.clone(),
 		config,
 		telemetry: telemetry.as_mut(),
 	})?;
+	let server_deps = pns_ddns::ServerDeps::<
+	FullClient,
+	FullBackend,
+	Block,
+	node_template_runtime::Runtime,
+>::new(
+	client.clone(),
+	backend,
+	ddns_manager.clone(),
+	network.clone(),
+	offchain_db,
+	task_manager.spawn_handle(),
+);
+
+task_manager.spawn_essential_handle().spawn_blocking(
+	"pns-server",
+	None,
+	server_deps.clone().init_server(std::net::SocketAddr::new(
+		std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+		if is_alice { 3000 } else { 3001 },
+	)),
+);
+
+task_manager.spawn_essential_handle().spawn_blocking(
+	"pns-ddns",
+	None,
+	server_deps.init_dns_server(if is_alice { 25353 } else { 25354 }),
+);
 
 	if role.is_authority() {
 		let proposer_factory = sc_basic_authorship::ProposerFactory::new(
@@ -320,7 +356,7 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 		let grandpa_config = sc_consensus_grandpa::GrandpaParams {
 			config: grandpa_config,
 			link: grandpa_link,
-			network,
+			network: network.clone(),
 			sync: Arc::new(sync_service),
 			voting_rule: sc_consensus_grandpa::VotingRulesBuilder::default().build(),
 			prometheus_registry,
@@ -338,5 +374,32 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 	}
 
 	network_starter.start_network();
+
+	task_manager.spawn_handle().spawn(
+		"ddns-init",
+		None,
+		pns_ddns::init_ddns::<_>(ddns_manager, network),
+	);
+
 	Ok(task_manager)
+}
+
+
+#[cfg(test)]
+#[test]
+fn gen_set_code() {
+	// TODO: Cli tool
+	use core::str::FromStr;
+	let code = pns_ddns::SetCode::<node_template_runtime::Runtime>::new::<
+		sp_core::sr25519::Pair,
+		sp_core::sr25519::Public,
+		sp_core::sr25519::Signature,
+	>(
+		sp_keyring::Sr25519Keyring::Bob.pair(),
+		pns_ddns::name_hash_str("cupnfish.dot").expect("create name hash failed."),
+		pns_ddns::RData::ANAME(
+			pns_ddns::Name::from_str("www.baidu.com").expect("create ddns Name failed."),
+		),
+	);
+	println!("{}", code.hex());
 }
